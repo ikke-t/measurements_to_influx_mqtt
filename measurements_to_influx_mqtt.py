@@ -77,12 +77,16 @@ def send_measurements_to_mqtt(m, conf):
         data['movementCount'] = m['sensors']['movementCount']
     if (m['type'] == 'mijia'):
         data['voltage'] = round(m['sensors']['voltage'], 2)
+        data['level'] = m['sensors']['level']
 
     logging.debug("MQTT out: %s:%s:%s",
-                  conf['mqtt_topic'],
+                  conf['mqtt_topic'] + '/' + data['address'],
                   conf['mqtt_broker'],
                   json.dumps(data))
-    publish.single(conf['mqtt_topic'], json.dumps(data), hostname=conf['mqtt_broker'])
+    publish.single(
+        conf['mqtt_topic']+ '/' + data['address'],
+        json.dumps(data),
+        hostname=conf['mqtt_broker'])
 
 def send_measurements_to_influxdb(m, conf):
     """
@@ -110,6 +114,7 @@ def send_measurements_to_influxdb(m, conf):
             .field('humidity', m['sensors']['humidity']) \
             .field('temperature', m['sensors']['temperature']) \
             .field('voltage', round(m['sensors']['voltage'], 2)) \
+            .field('level', m['sensors']['level']) \
             .time(time)
 
     logging.debug(f"Writing influx: {point.to_line_protocol()}")
