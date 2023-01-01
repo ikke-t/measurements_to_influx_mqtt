@@ -1,0 +1,14 @@
+[Unit]
+Description=Forward BT sensor data to influx and mqtt
+After=syslog.target network.target
+
+[Service]
+Type=simple
+#User=pi
+WorkingDirectory=/home/pi/src/measurements_to_influx_mqtt
+ExecStart=/home/pi/src/measurements_to_influx_mqtt/bin/python /home/pi/src/measurements_to_influx_mqtt/measurements_to_influx_mqtt.py
+Restart=on-failure
+# RuntimeMaxSec=90
+
+[Install]
+WantedBy=multi-user.target
