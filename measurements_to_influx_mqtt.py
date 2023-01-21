@@ -14,7 +14,7 @@ License: GPLv3 or later
 """
 
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import socket
 import configparser
@@ -26,13 +26,20 @@ import paho.mqtt.client as mqtt
 from paho.mqtt import publish
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
+from influxdb_client.client.exceptions import InfluxDBError
 
 def get_config():
+    conf_file = 'measurements_to_influx_mqtt.ini'
+    if not os.path.exists(conf_file) :
+        print('Error: Config file not found %s', conf_file)
+        sys.exit(-1)
+
     config = configparser.ConfigParser()
-    config.read('measurements_to_influx_mqtt.ini')
+    config.read(conf_file)
 
     conf['verbosity'] = config.get('debug', 'verbosity', fallback='NOTSET')
-    conf['socket_path'] = config.get('global', 'socket_path') 
+    conf['socket_path'] = config.get('global', 'socket_path')
+    conf['min_interval_secs'] = int(config.get('global', 'min_interval_secs'))
     conf['mqtt_broker'] = config.get('mqtt', 'mqtt_broker')
     conf['mqtt_topic'] = config.get('mqtt', 'mqtt_topic')
     conf['influx_url'] = config.get('influx2', 'url')
@@ -45,7 +52,6 @@ def get_config():
 def signal_handler(signal, frame):
     print('\nterminating gracefully.')
     client.disconnect()
-    server.close()
     os.remove(conf['socket_path'])
     sys.exit(0)
 
@@ -88,6 +94,10 @@ def send_measurements_to_mqtt(m, conf):
         json.dumps(data),
         hostname=conf['mqtt_broker'])
 
+def on_mqtt_log(client, userdata, level, buf):
+    if logging.root.level >= logging.WARNING:
+        logging.warning("log: %s", buf)
+
 def send_measurements_to_influxdb(m, conf):
     """
     Send data to influxdb.
@@ -118,9 +128,12 @@ def send_measurements_to_influxdb(m, conf):
             .time(time)
 
     logging.debug(f"Writing influx: {point.to_line_protocol()}")
-    client_response = conf['write_api'].write(
-                          bucket=conf['influx_bucket'],
-                          record=point)
+    try:
+        client_response = conf['write_api'].write(
+                              bucket=conf['influx_bucket'],
+                              record=point)
+    except InfluxDBError as e:
+        logging.info('influx error: %s', e.response.status)
     # write() returns None on success
     return client_response
 
@@ -129,7 +142,10 @@ if __name__ == "__main__":
 	# pylint: disable=C0103
     error = False
     i = 0
+    ignored = 0
+    inf_success = None
     conf = {}
+    last_sent = {}
 
     signal.signal(signal.SIGINT, signal_handler)
     conf = get_config()
@@ -141,6 +157,8 @@ if __name__ == "__main__":
     client.on_connect = on_connect
     client.connect(conf['mqtt_broker'], 1883, 60)
     client.loop_start()
+    client.enable_logger(logging)
+
 
     # Get influxdb connection
     influxdb_client = InfluxDBClient(url=conf['influx_url'],
@@ -151,25 +169,38 @@ if __name__ == "__main__":
     if os.path.exists(conf['socket_path']):
         os.remove(conf['socket_path'])
 
-    os.umask(0o000)
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(conf['socket_path'])
-    server.listen(1)
-    conn, addr = server.accept()
+    os.umask(0o077)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.bind(conf['socket_path'])
+        logging.info('listening socket %s', conf['socket_path'])
+        s.listen(1)
 
-    while True:
-        i += 1 
-        line_in = conn.recv(1024)
-        if line_in:
-            data = json.loads(line_in) 
-            # logging.debug(data_json)
-            send_measurements_to_mqtt(data, conf)
-            send_measurements_to_influxdb(data, conf)
-        else:
-            logging.debug("no data [%i]", i)
-            time.sleep(30)
+        min_delta = timedelta(seconds=conf['min_interval_secs'])
+        # we sit in loop receiving socket connections
+        while True:
+            i += 1
+            conn, addr = s.accept()
+            with conn:
+                logging.info(f'socket connected by {addr}')
+                while True:
+                    line_in = conn.recv(1024)
+                    if not line_in:
+                        break
+                    now = datetime.now()
+                    data = json.loads(line_in)
+                    dev = data['device']['address']
+                    if dev in last_sent and min_delta > now - last_sent[dev]:
+                        ignored += 1
+                        if not ignored % 100:
+                            logging.info('ignored measures: %d', ignored)
+                        continue
+                    # logging.debug(data)
+                    send_measurements_to_mqtt(data, conf)
+                    inf_success = send_measurements_to_influxdb(data, conf)
+                    if inf_success != None:
+                       logging.info("failed sending to influx at round [%i]", i)
+                    last_sent[dev] = now
 
-    server.close()
     os.remove(conf['socket_path'])
     client.disconnect()
     exit()
